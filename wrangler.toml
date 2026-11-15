@@ -1,18 +1,8 @@
-name = "jaat-proxy"
+name = "jaat-match"
 main = "worker.js"
-compatibility_date = "2024-11-01"
+compatibility_date = "2025-04-01"
 
-# Har deploy par dashboard wale variables/secrets (SOURCES, SECRET_KEY) udd jaate the.
-# Ye line unhe bachaa ke rakhti hai.
-keep_vars = true
-
-[[rules]]
-type = "Text"
-globs = ["**/*.html"]
-fallthrough = true
-
-# Agar chaho ki variable kabhi na udde, to dashboard ki jagah yahan likh do
-# (upar keep_vars hata do, dono saath mat rakho):
-# [vars]
-# SOURCES = "https://example.com/links.json"
-# SECRET_KEY = "koi-lamba-random-text"
+[assets]
+directory = "./"
+binding = "ASSETS"
+run_worker_first = true

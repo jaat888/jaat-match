@@ -337,7 +337,11 @@ export default {
     var self = new URL(req.url);
     var path = self.pathname;
 
-    if(path !== "/p" && path !== "/s" && path !== "/list") return env.ASSETS.fetch(req);
+    if(path !== "/p" && path !== "/s" && path !== "/list"){
+      /* sab files ek hi folder me hain, isliye sirf website dikhao; worker.js / wrangler.toml band */
+      if(path === "/" || path === "/index.html") return env.ASSETS.fetch(req);
+      return new Response("not found", { status: 404 });
+    }
     if(req.method === "OPTIONS") return new Response(null, { headers: CORS });
 
     /* ---- /list ---- */
