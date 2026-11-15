@@ -115,6 +115,10 @@
   #fr{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;display:none;z-index:4}
   #frX{position:absolute;top:.6rem;right:.6rem;z-index:11;display:none;padding:.4rem .75rem;border-radius:.7rem;cursor:pointer;font-weight:700;font-size:.75rem;border:1px solid var(--line2);background:rgba(3,5,8,.8);color:#d3dbe8}
   #playerBox.framed #frX{display:block}
+  #modeBar{display:flex;gap:.45rem;margin-top:.55rem;flex-wrap:wrap}
+  #modeBar[hidden]{display:none}
+  #modeBar button{padding:.5rem .8rem;border-radius:.75rem;cursor:pointer;font-weight:700;font-size:.78rem;border:1px solid var(--line2);background:rgba(255,255,255,.06);color:#d3dbe8}
+  #modeBar button.on{border-color:rgba(46,224,176,.5);background:rgba(46,224,176,.14);color:#9df3d6}
   #playerBox.framed #ctl,#playerBox.framed #bigPlay,#playerBox.framed #empty,#playerBox.framed #spin,#playerBox.framed #status{display:none!important}
   #empty{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.7rem;
@@ -319,7 +323,8 @@
     <div class="pwrap">
       <div id="playerBox" tabindex="0">
         <video id="vid" playsinline webkit-playsinline preload="auto"></video>
-        <iframe id="fr" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"></iframe>
+        <iframe id="fr" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="no-referrer"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-presentation allow-orientation-lock"></iframe>
         <button id="frX">&#10005; Band karo</button>
         <div id="empty">
           <div class="ring"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg></div>
@@ -358,6 +363,12 @@
         <span class="badge idle" id="nowBadge">READY</span>
         <b id="nowName">Koi channel nahi chuna</b>
         <button class="btn-i" id="favNow" aria-label="Favourite" hidden>&#9734;</button>
+      </div>
+      <div id="modeBar" hidden>
+        <button data-m="direct">Seedha</button>
+        <button data-m="clean">Promo hatao</button>
+        <button data-m="proxy">Proxy player</button>
+        <button data-m="fs">&#x26F6;</button>
       </div>
     </div>
   </section>
@@ -417,8 +428,16 @@
   function sget(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
   function sset(k, v){ try{ localStorage.setItem(k, v); }catch(e){} }
 
-  var ALL = [], shown = [], activeId = null, hls = null, dash = null, cacheKey = "jm_links_v6";
-  var curFrame = "", frEl = $("#fr"), frBtn = $("#frameBtn"), frX = $("#frX");
+  var ALL = [], shown = [], activeId = null, hls = null, dash = null, cacheKey = "jm_links_v7";
+  var curFrame = "", frEl = $("#fr"), frBtn = $("#frameBtn"), frX = $("#frX"), modeBar = $("#modeBar");
+  var MODE = sget("jm_mode") || "clean";
+  if(["direct", "clean", "proxy"].indexOf(MODE) < 0) MODE = "direct";
+  function renderMode(){
+    modeBar.hidden = !(curItem && curItem.k === "web");
+    Array.prototype.forEach.call(modeBar.querySelectorAll("button[data-m]"), function(b){
+      b.classList.toggle("on", b.getAttribute("data-m") === MODE);
+    });
+  }
   var filter = "all", favs = {};
   try{ favs = JSON.parse(sget("jm_favs") || "{}") || {}; }catch(e){ favs = {}; }
 
@@ -822,6 +841,14 @@
     markActive(); syncNow();
     if(scroll && !isFs()){ try{ box.scrollIntoView({ behavior: "smooth", block: "nearest" }); }catch(e){} }
 
+    renderMode();
+    if(it.k === "web" && MODE !== "proxy" && PROXY){
+      setBusy(false);
+      frEl.src = PROXY + (MODE === "clean" ? "/c" : "/f") + "?t=" + encodeURIComponent(it.t);
+      frEl.style.display = "block";
+      box.classList.add("framed"); box.classList.remove("show");
+      return;
+    }
     if(!PROXY){ showErr("Worker se kholo", "Ye page worker ke link se khulna chahiye"); return; }
     fetchJson(PROXY + "/start?t=" + encodeURIComponent(it.t)).then(function(r){
       if(token !== playToken) return;
@@ -862,6 +889,13 @@
   };
   $("#nextBtn2").onclick = function(){ step(1); };
   frBtn.onclick = function(){ openFrame(); };
+  modeBar.onclick = function(e){
+    var b = e.target.closest("button[data-m]"); if(!b) return;
+    var m = b.getAttribute("data-m");
+    if(m === "fs"){ fsBtn.click(); return; }
+    MODE = m; sset("jm_mode", m); renderMode();
+    if(curItem) play(curItem.id);
+  };
   frX.onclick = function(){
     closeFrame();
     if(curItem) showErr("Original player band kiya", "Dobara try ya dusra channel chuno");
@@ -1083,7 +1117,7 @@
       .then(function(j){
         clearTimeout(to);
         if(!j || !j.ok || !j.items || !j.items.length) throw 0;
-        ALL = j.items.map(function(x, i){ return { id: i, name: x.name, t: x.t }; });
+        ALL = j.items.map(function(x, i){ return { id: i, name: x.name, t: x.t, k: x.k || "" }; });
         if(curItem){
           var same = ALL.filter(function(x){ return x.name === curItem.name; })[0];
           activeId = same ? same.id : null;

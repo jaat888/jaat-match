@@ -2,7 +2,8 @@
 //   /                    -> website (index.html)
 //   /list                -> channel list (naam + encrypted token). Asli URL client ko nahi jata.
 //   /start               -> token kholta hai, (web page ho to) page se stream nikaalta hai
-//   /f                   -> asli player ko iframe mein kholna (fallback)
+//   /f                   -> asli player ko iframe mein kholna (seedha)
+//   /c                   -> asli player ka saaf version (Telegram promo hata ke)
 //   /s                   -> stream / playlist / manifest proxy (HLS + DASH dono rewrite hote hain)
 //   /p/<token>/<path>    -> DASH segments proxy (MPD ke relative links yahin se guzarte hain)
 //   /manifest.webmanifest, /sw.js, /icon-*.png -> "Install App" (PWA) ke liye
@@ -219,7 +220,7 @@ async function list(env) {
       const items = harvest(data);
       if (!items.length) continue;
       const out = [];
-      for (const it of items) out.push({ name: it.name, t: await seal({ u: it.url, k: it.k || "" }, env) });
+      for (const it of items) out.push({ name: it.name, k: kindOf(it.url), t: await seal({ u: it.url, k: it.k || "" }, env) });
       return json({ ok: true, items: out });
     } catch (e) {}
   }
@@ -580,6 +581,116 @@ async function frameRedirect(tok, env) {
   return new Response(null, { status: 302, headers: { "Location": o.u.replace(/^http:\/\//i, "https://"), "Cache-Control": "no-store" } });
 }
 
+/* ---------------- /c : original player ka "saaf" version (Telegram promo hatao) ----------------
+   Worker original page ko laata hai, usme <base> + ek chhota cleaner script daalta hai jo
+   t.me / telegram wale link, image aur chhote promo text ko chhupa deta hai.
+   (cross-origin iframe ke andar browser se ye possible nahi, isliye worker se karte hain) */
+function cleanerMain(origPS) {
+  try { history.replaceState(null, "", origPS); } catch (e) {}
+  try { window.open = function () { return null; }; } catch (e) {}
+  var PROMO_HREF = /(?:^|\/\/)(?:www\.)?(?:t\.me|telegram\.(?:me|org|dog))|^tg:/i;
+  var PROMO_TXT = /telegram|t\.me\/|join (?:our|us|now)/i;
+  var HEAVY = "video,canvas,iframe,input,select,textarea";
+  function attr(el, n) { return (el.getAttribute && el.getAttribute(n)) || ""; }
+  function isPromo(el) {
+    var h = attr(el, "href");
+    if (h && PROMO_HREF.test(h)) return true;
+    if (el.tagName === "IMG" && /telegram|t\.me|tg[-_]/i.test(attr(el, "src") + " " + attr(el, "alt") + " " + attr(el, "title"))) return true;
+    return false;
+  }
+  function ownText(e) {
+    var s = "";
+    for (var n = e.firstChild; n; n = n.nextSibling) if (n.nodeType === 3) s += n.nodeValue;
+    return s;
+  }
+  // p ke andar c ke alawa koi kaam ki cheez (video / button / text) na ho
+  function onlyPromo(p, c) {
+    if (p.querySelector(HEAVY)) return false;
+    var bs = p.querySelectorAll("button,a,[role=button]");
+    for (var i = 0; i < bs.length; i++) if (!c.contains(bs[i]) && !isPromo(bs[i])) return false;
+    return ((p.textContent || "").length - (c.textContent || "").length) < 25;
+  }
+  function hide(el) {
+    var c = el;
+    for (var n = 0; n < 4; n++) {
+      var p = c.parentElement;
+      if (!p || p === document.body || p === document.documentElement) break;
+      if (!onlyPromo(p, c)) break;
+      c = p;
+    }
+    c.style.setProperty("display", "none", "important");
+    c.setAttribute("data-jm", "1");
+  }
+  function sweep() {
+    try {
+      var a = document.querySelectorAll("a[href],img");
+      for (var i = 0; i < a.length; i++) if (!a[i].getAttribute("data-jm") && isPromo(a[i])) hide(a[i]);
+      var e = document.querySelectorAll("div,span,p,b,i,strong,small,label,li,h1,h2,h3,h4,h5");
+      for (var j = 0; j < e.length; j++) {
+        if (e[j].getAttribute("data-jm")) continue;
+        var t = ownText(e[j]);
+        if (t.length > 0 && t.length < 140 && PROMO_TXT.test(t)) hide(e[j]);
+      }
+    } catch (x) {}
+  }
+  var tm = 0;
+  document.addEventListener("DOMContentLoaded", sweep);
+  try {
+    new MutationObserver(function () {
+      if (!tm) tm = setTimeout(function () { tm = 0; sweep(); }, 150);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+  setInterval(sweep, 1500);
+}
+
+function redirect302(u) {
+  return new Response(null, { status: 302, headers: { "Location": u, "Cache-Control": "no-store" } });
+}
+
+async function cleanFrame(tok, env, self) {
+  const o = await unseal(tok, env);
+  if (!o || !o.u || kindOf(o.u) !== "web") return new Response("forbidden", { status: 403, headers: CORS });
+  const url = o.u;
+  const httpsUrl = url.replace(/^http:\/\//i, "https://");
+  let r;
+  try { r = await fetch(url, { headers: pageHeaders(url, ""), redirect: "follow", signal: AbortSignal.timeout(10000) }); }
+  catch (e) { return redirect302(httpsUrl); }
+  const ct = (r.headers.get("content-type") || "").toLowerCase();
+  if (!r.ok || ct.indexOf("html") < 0) return redirect302(httpsUrl);
+  const finalUrl = (r.url || url).replace(/^http:\/\//i, "https://");   // browser mein mixed-content na ho
+  let html = await r.text();
+  let ps = "/";
+  try { const x = new URL(finalUrl); ps = x.pathname + x.search; } catch (e) {}
+  html = html.replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "");
+
+  // andar ke iframe bhi worker ke /c se guzarein (unka promo bhi hatega, link bhi chhup jayega)
+  {
+    const re = /(<iframe\b[^>]*?(?<![-\w])src=)(["'])([^"']+)\2/gi;
+    const parts = [];
+    let last = 0, m;
+    while ((m = re.exec(html))) {
+      parts.push(html.slice(last, m.index));
+      let rep = m[0];
+      try {
+        const abs = new URL(m[3].replace(/&amp;/g, "&"), finalUrl).toString();
+        if (/^https?:/i.test(abs) && kindOf(abs) === "web") rep = m[1] + m[2] + self + "/c?t=" + await seal({ u: abs, k: "" }, env) + m[2];
+      } catch (e) {}
+      parts.push(rep);
+      last = m.index + m[0].length;
+    }
+    parts.push(html.slice(last));
+    html = parts.join("");
+  }
+
+  const css = '<style>a[href*="t.me/"],a[href*="telegram.me"],a[href*="telegram.org"],a[href^="tg:"],img[src*="telegram" i],img[alt*="telegram" i]{display:none!important}</style>';
+  const inject = '<base href="' + finalUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '">' + css +
+    "<script>(" + cleanerMain.toString() + ")(" + JSON.stringify(ps).replace(/</g, "\\u003c") + ");</script>";
+  if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, (m) => m + inject);
+  else if (/<html[^>]*>/i.test(html)) html = html.replace(/<html[^>]*>/i, (m) => m + inject);
+  else html = inject + html;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" } });
+}
+
 /* ---------------- HLS playlist rewrite ---------------- */
 async function rewriteM3u8(text, base, ref, self, env) {
   const P = async (u, isPl) => {
@@ -811,6 +922,7 @@ export default {
       if (path === "/start") return await start(u.searchParams.get("t"), env);
       if (path === "/diag") return await diag(u.searchParams.get("t"), env);
       if (path === "/f") return await frameRedirect(u.searchParams.get("t"), env);
+      if (path === "/c") return await cleanFrame(u.searchParams.get("t"), env, u.origin);
       if (path === "/s") return await stream(u.searchParams.get("t"), env, u.origin, req);
       if (path === "/manifest.webmanifest") {
         return new Response(JSON.stringify(MANIFEST), { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });
