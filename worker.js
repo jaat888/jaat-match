@@ -2,6 +2,7 @@
 //   /                    -> website (index.html)
 //   /list                -> channel list (naam + encrypted token). Asli URL client ko nahi jata.
 //   /start               -> token kholta hai, (web page ho to) page se stream nikaalta hai
+//   /f                   -> asli player ko iframe mein kholna (fallback)
 //   /s                   -> stream / playlist / manifest proxy (HLS + DASH dono rewrite hote hain)
 //   /p/<token>/<path>    -> DASH segments proxy (MPD ke relative links yahin se guzarte hain)
 //   /manifest.webmanifest, /sw.js, /icon-*.png -> "Install App" (PWA) ke liye
@@ -247,37 +248,134 @@ function decodeB64(t) {
   return out.join("\n");
 }
 
-function extractStreams(raw, base) {
-  const txt = normalize(raw + "\n" + decodeB64(raw));
+/* ---------- page ke andar chhupi stream dhundhne ke tools ---------- */
+
+// Dean Edwards packer:  eval(function(p,a,c,k,e,d){...}('....',62,N,'a|b|c'.split('|'),0,{}))
+function unpackAll(txt) {
+  let out = "";
+  const re = /\}\s*\(\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*\.split\(\s*['"]\|['"]\s*\)/g;
+  let m, guard = 0;
+  while ((m = re.exec(txt)) && guard++ < 6) {
+    try {
+      const p = m[1].slice(1, -1).replace(/\\(['"\\])/g, "$1");
+      const a = +m[2];
+      let c = +m[3];
+      const k = m[4].slice(1, -1).split("|");
+      const e = (n) => (n < a ? "" : e(Math.floor(n / a))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
+      const d = {};
+      while (c--) d[e(c)] = k[c] || e(c);
+      out += "\n" + p.replace(/\b\w+\b/g, (w) => (d[w] !== undefined ? d[w] : w));
+    } catch (x) {}
+  }
+  return out;
+}
+
+function unescapeJs(t) {
+  return t.replace(/\\x([0-9a-f]{2})/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
+          .replace(/\\u([0-9a-f]{4})/gi, (m, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
+// lambi base64 strings jinke andar link chhupa ho ("aHR0cHM6Ly8...")
+function decodeBlobs(t) {
+  const out = [];
+  const re = /["'`=]([A-Za-z0-9+\/_-]{32,}={0,2})(?=["'`&\s]|$)/g;
+  let m, n = 0;
+  while ((m = re.exec(t)) && n < 60) {
+    n++;
+    try {
+      let s = m[1].replace(/-/g, "+").replace(/_/g, "/");
+      while (s.length % 4) s += "=";
+      const d = atob(s);
+      if (/^[\x09\x0a\x0d\x20-\x7e]+$/.test(d) && /(https?:\/\/|\.m3u8|\.mpd)/i.test(d)) out.push(d);
+    } catch (e) {}
+  }
+  return out.join("\n");
+}
+
+// ulte likhe link ("8u3m.xedni/...//:sptth")
+function decodeReversed(t) {
+  const out = [];
+  const re = /["'`]((?:8u3m|dpm)\.[^"'`\s]{8,})["'`]/gi;
+  let m, n = 0;
+  while ((m = re.exec(t)) && n < 20) {
+    n++;
+    const r = m[1].split("").reverse().join("");
+    if (/^https?:\/\//i.test(r)) out.push(r);
+  }
+  return out.join("\n");
+}
+
+function expandText(raw) {
+  let t = raw + "\n" + decodeB64(raw);
+  t += "\n" + unpackAll(t);
+  t = normalize(unescapeJs(t));
+  t += "\n" + decodeBlobs(t) + "\n" + decodeReversed(t);
+  return normalize(t);
+}
+
+// ClearKey: "kid:key" (32 hex : 32 hex) ya keyId / key alag-alag
+function extractKey(txt) {
+  const m = txt.match(/([0-9a-f]{32})["']?\s*[:=,]\s*["']?([0-9a-f]{32})/i);
+  if (m) return m[1].toLowerCase() + ":" + m[2].toLowerCase();
+  const kid = txt.match(/key_?id["']?\s*[:=]\s*["']([0-9a-f]{32})["']/i);
+  const key = txt.match(/\bkey["']?\s*[:=]\s*["']([0-9a-f]{32})["']/i);
+  if (kid && key) return kid[1].toLowerCase() + ":" + key[1].toLowerCase();
+  return "";
+}
+
+function extractStreams(raw, base, hint) {
+  const txt = expandText(raw);
   const found = [];
   const seen = new Set();
-  const add = (u) => {
+  const add = (u, idx) => {
     if (/[{}$]/.test(u)) return;
     try {
       const a = new URL(u, base).toString();
       if (!/^https?:/i.test(a) || seen.has(a)) return;
-      seen.add(a); found.push(a);
+      seen.add(a); found.push({ u: a, i: idx });
     } catch (e) {}
   };
   const re1 = /["'`(]\s*((?:https?:)?\/\/[^"'`\s<>)]+?\.(?:m3u8|mpd)(?:\?[^"'`\s<>)]*)?|[^"'`\s<>)]+?\.(?:m3u8|mpd)(?:\?[^"'`\s<>)]*)?)\s*["'`)]/gi;
   let m;
-  while ((m = re1.exec(txt))) add(m[1]);
+  while ((m = re1.exec(txt))) add(m[1], m.index);
   const re2 = /https?:\/\/[^\s"'`<>)\\]+?\.(?:m3u8|mpd)(?:\?[^\s"'`<>)\\]*)?/gi;
-  while ((m = re2.exec(txt))) add(m[0]);
-  found.sort((a, b) => (/\.mpd/i.test(a) ? 1 : 0) - (/\.mpd/i.test(b) ? 1 : 0));
-  return found;
+  while ((m = re2.exec(txt))) add(m[0], m.index);
+  // page ek se zyada channel ki list rakhti ho to jis ke paas channel ka id likha ho wo pehle
+  const h = String(hint || "").toLowerCase();
+  if (h.length > 1 && found.length > 1) {
+    const low = txt.toLowerCase();
+    const pos = [];
+    let p = low.indexOf(h);
+    while (p > -1 && pos.length < 60) { pos.push(p); p = low.indexOf(h, p + 1); }
+    const dist = (f) => {
+      let best = 1e9;
+      for (const q of pos) { const d = Math.abs(q - f.i); if (d < best) best = d; }
+      return best > 400 ? 1e9 : best;
+    };
+    found.forEach((f) => { f.d = dist(f); });
+    found.sort((a, b) => (a.d - b.d) || ((/\.mpd/i.test(a.u) ? 1 : 0) - (/\.mpd/i.test(b.u) ? 1 : 0)));
+  } else {
+    found.sort((a, b) => (/\.mpd/i.test(a.u) ? 1 : 0) - (/\.mpd/i.test(b.u) ? 1 : 0));
+  }
+  return found.map((f) => f.u);
 }
 
 function extractIframes(raw, base) {
   const out = [];
-  const re = /<iframe[^>]+?src=["']([^"']+)["']/gi;
-  let m;
-  while ((m = re.exec(raw))) {
+  const add = (u) => {
     try {
-      const a = new URL(m[1].replace(/&amp;/g, "&"), base).toString();
-      if (/^https?:/i.test(a)) out.push(a);
+      const a = new URL(String(u).replace(/&amp;/g, "&"), base).toString();
+      if (/^https?:/i.test(a) && out.indexOf(a) < 0) out.push(a);
     } catch (e) {}
-  }
+  };
+  let m;
+  const re = /<(?:iframe|frame|embed)[^>]+?src=["']([^"']+)["']/gi;
+  while ((m = re.exec(raw))) add(m[1]);
+  // redirect wale pages
+  const rm = /<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=([^"'>\s]+)/gi;
+  while ((m = rm.exec(raw))) add(m[1]);
+  const rl = /(?:window\.|top\.|parent\.|document\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']|location\.(?:replace|assign)\(\s*["']([^"']+)["']\s*\)/gi;
+  while ((m = rl.exec(raw))) { const u = m[1] || m[2]; if (u && !/^(#|javascript:)/i.test(u)) add(u); }
   return out;
 }
 
@@ -287,79 +385,103 @@ function typeOf(u) {
   return /\.mpd$/i.test(p) ? "dash" : "hls";
 }
 
+function shortUrl(u) {
+  try { const x = new URL(u); return (x.host + x.pathname).slice(0, 70); } catch (e) { return String(u).slice(0, 50); }
+}
+
+function hintOf(u) {
+  try {
+    const x = new URL(u);
+    for (const k of ["id", "ch", "channel", "c", "stream", "name"]) { const v = x.searchParams.get(k); if (v) return v; }
+    const last = x.pathname.split("/").filter(Boolean).pop() || "";
+    return last.length > 1 ? last : "";
+  } catch (e) { return ""; }
+}
+
 async function resolveStreams(target) {
   const streams = [];
   const seenStream = new Set();
   const visited = new Set();
+  const trace = [];
+  let pageKey = "";
+  const hint = hintOf(target);
+
+  const addStream = (url, type, ref, key) => {
+    if (seenStream.has(url)) return;
+    seenStream.add(url);
+    streams.push({ url: url, type: type, ref: ref || "", key: key || "" });
+  };
 
   async function scan(pageUrl, depth, ref) {
-    if (visited.has(pageUrl) || visited.size >= 12) return;
+    if (visited.has(pageUrl) || visited.size >= 22) return;
     visited.add(pageUrl);
+
+    // link ke query mein hi stream (+key) ho to fetch ki zaroorat nahi
+    const fq = depth > 0 ? fromQuery(pageUrl) : [];
+    if (fq.length) {
+      fq.forEach((s) => addStream(s.url, s.type, s.ref, s.key));
+      trace.push("query " + shortUrl(pageUrl) + " -> " + fq.length + " stream");
+      return;
+    }
+
     let r;
-    try { r = await fetch(pageUrl, { headers: pageHeaders(pageUrl, ref), redirect: "follow" }); }
-    catch (e) { return; }
+    try { r = await fetch(pageUrl, { headers: pageHeaders(pageUrl, ref), redirect: "follow", signal: AbortSignal.timeout(9000) }); }
+    catch (e) { trace.push(shortUrl(pageUrl) + " -> fetch fail"); return; }
     const finalUrl = r.url || pageUrl;
     const ct = (r.headers.get("content-type") || "").toLowerCase();
-    if (/mpegurl/.test(ct)) {
-      if (!seenStream.has(finalUrl)) { seenStream.add(finalUrl); streams.push({ url: finalUrl, type: "hls", ref: ref || "" }); }
-      return;
-    }
-    if (/dash\+xml/.test(ct)) {
-      if (!seenStream.has(finalUrl)) { seenStream.add(finalUrl); streams.push({ url: finalUrl, type: "dash", ref: ref || "" }); }
-      return;
-    }
+    if (/mpegurl/.test(ct)) { addStream(finalUrl, "hls", ref, ""); trace.push(shortUrl(finalUrl) + " -> hls playlist"); return; }
+    if (/dash\+xml/.test(ct)) { addStream(finalUrl, "dash", ref, ""); trace.push(shortUrl(finalUrl) + " -> dash manifest"); return; }
     let txt = "";
     try { txt = await r.text(); } catch (e) { return; }
-    if (txt.length > 1500000) txt = txt.slice(0, 1500000);
+    if (txt.length > 900000) txt = txt.slice(0, 900000);
 
-    // content-type galat ho tab bhi, body dekh kar pehchaan lo
     const head = txt.trimStart().slice(0, 400);
-    if (head.indexOf("#EXTM3U") === 0) {
-      if (!seenStream.has(finalUrl)) { seenStream.add(finalUrl); streams.push({ url: finalUrl, type: "hls", ref: ref || "" }); }
-      return;
-    }
-    if (/<MPD[\s>]/.test(head)) {
-      if (!seenStream.has(finalUrl)) { seenStream.add(finalUrl); streams.push({ url: finalUrl, type: "dash", ref: ref || "" }); }
-      return;
-    }
+    if (head.indexOf("#EXTM3U") === 0) { addStream(finalUrl, "hls", ref, ""); trace.push(shortUrl(finalUrl) + " -> hls playlist"); return; }
+    if (/<MPD[\s>]/.test(head)) { addStream(finalUrl, "dash", ref, ""); trace.push(shortUrl(finalUrl) + " -> dash manifest"); return; }
 
-    extractStreams(txt, finalUrl).forEach((s) => {
-      if (seenStream.has(s)) return;
-      seenStream.add(s);
-      streams.push({ url: s, type: typeOf(s), ref: finalUrl });
-    });
+    const k = extractKey(expandText(txt));
+    if (k && !pageKey) pageKey = k;
 
-    if (!streams.length && depth < 2) {
-      const frames = extractIframes(txt, finalUrl).slice(0, 4);
-      for (const f of frames) {
+    const found = extractStreams(txt, finalUrl, hint);
+    found.forEach((s) => addStream(s, typeOf(s), finalUrl, ""));
+    const frames = extractIframes(txt, finalUrl);
+    trace.push(shortUrl(finalUrl) + " -> HTTP " + r.status + " " + txt.length + "b, stream " + found.length + ", frame " + frames.length + (k ? ", key" : ""));
+    if (streams.length) return;
+
+    if (depth < 3) {
+      for (const f of frames.slice(0, 4)) {
         await scan(f, depth + 1, finalUrl);
-        if (streams.length) break;
+        if (streams.length) return;
       }
-    }
-    // player page ke andar ki js / api files bhi dekho (stream wahin chhupi hoti hai)
-    if (!streams.length && depth < 2) {
-      const extra = extraResources(txt, finalUrl).slice(0, 6);
-      for (const x of extra) {
+      // player page ke andar ki js / api files bhi dekho (stream wahin chhupi hoti hai)
+      for (const x of extraResources(txt, finalUrl, hint).slice(0, 8)) {
         await scan(x, depth + 1, finalUrl);
-        if (streams.length) break;
+        if (streams.length) return;
       }
     }
   }
 
   await scan(target, 0, "");
+  streams.forEach((s) => { if (s.type === "dash" && !s.key && pageKey) s.key = pageKey; });
+  streams.trace = trace;
   return streams;
 }
 
-// page ki same-site <script src> aur fetch("...") wali api files
-function extraResources(raw, base) {
+// page ki same-site <script src> aur fetch("...") / .json / .php wali api files
+function extraResources(raw, base, hint) {
   const out = [], seen = new Set();
   let origin = ""; try { origin = new URL(base).origin; } catch (e) {}
-  const add = (u) => {
+  const h = encodeURIComponent(hint || "");
+  const add = (u0) => {
+    let u = String(u0).replace(/&amp;/g, "&");
+    if (/\$\{[^}]*\}|\{[a-z_]*id[a-z_]*\}/i.test(u)) { if (!h) return; u = u.replace(/\$\{[^}]*\}|\{[a-z_]*id[a-z_]*\}/gi, h); }
     if (/[{}$]/.test(u)) return;
+    if (h && /[=\/]$/.test(u) && !/^(https?:)?\/\/$/.test(u)) u += h;   // "api?id=" + id wali concat
     try {
-      const a = new URL(u.replace(/&amp;/g, "&"), base);
+      const a = new URL(u, base);
       if (!/^https?:$/.test(a.protocol)) return;
-      if (/\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)$/i.test(a.pathname)) return;
+      if (/\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf|webp|mp3)$/i.test(a.pathname)) return;
+      if (/(google|gstatic|facebook|twitter|cloudflare|jquery|bootstrap|fontawesome|analytics|doubleclick|googletag|disqus)/i.test(a.host)) return;
       const s = a.toString();
       if (seen.has(s) || s === base) return;
       seen.add(s); out.push(s);
@@ -368,11 +490,15 @@ function extraResources(raw, base) {
   let m;
   const rs = /<script[^>]+?src=["']([^"']+)["']/gi;
   while ((m = rs.exec(raw))) { try { if (new URL(m[1], base).origin === origin) add(m[1]); } catch (e) {} }
-  const rf = /(?:fetch|axios\.get|getJSON|\$\.get)\(\s*["'`]([^"'`]+)["'`]/gi;
+  const rf = /(?:fetch|axios\.get|axios|getJSON|\$\.get|\$\.ajax|\.load)\(\s*\{?\s*(?:url\s*:\s*)?["'`]([^"'`]+)["'`]/gi;
   while ((m = rf.exec(raw))) add(m[1]);
   const ro = /\.open\(\s*["'][A-Za-z]+["']\s*,\s*["'`]([^"'`]+)["'`]/gi;
   while ((m = ro.exec(raw))) add(m[1]);
-  return out;
+  const rj = /["'`]([^"'`\s<>]+\.(?:json|php|txt|aspx?)(?:\?[^"'`\s<>]*)?)["'`]/gi;
+  while ((m = rj.exec(raw))) add(m[1]);
+  // api jaisi dikhne wale pehle
+  const pri = (u) => (/(api|stream|chan|link|token|live|source|play|config|data|\.json|\.php)/i.test(u) ? 0 : 1);
+  return out.map((u, i) => ({ u, i })).sort((a, b) => (pri(a.u) - pri(b.u)) || (a.i - b.i)).map((x) => x.u);
 }
 
 // wrapper link ke QUERY ke andar hi manifest + ClearKey hota hai:
@@ -385,6 +511,7 @@ function fromQuery(pageUrl) {
   let q = u.search.slice(1);
   try { q = decodeURIComponent(q); } catch (e) {}
   q = normalize(q);
+  q += "\n" + decodeBlobs(q);
   let key = "";
   const km = q.match(/([0-9a-f]{32})["']?\s*[:=,]\s*["']?([0-9a-f]{32})/i);
   if (km) key = km[1].toLowerCase() + ":" + km[2].toLowerCase();
@@ -412,18 +539,27 @@ function fromQuery(pageUrl) {
 
 async function resolveAny(o) {
   const k = kindOf(o.u);
-  if (k !== "web") return [{ url: o.u, type: k, ref: o.r || "", key: o.k || "" }];
+  if (k !== "web") { const one = [{ url: o.u, type: k, ref: o.r || "", key: o.k || "" }]; one.trace = ["direct link"]; return one; }
   const q = fromQuery(o.u);
-  if (q.length) return q.map((s) => Object.assign({}, s, { key: s.key || o.k || "" }));
-  return (await resolveStreams(o.u)).map((s) => Object.assign({}, s, { key: o.k || "" }));
+  if (q.length) {
+    const r = q.map((s) => Object.assign({}, s, { key: s.key || o.k || "" }));
+    r.trace = ["link ke query mein stream mili: " + q.length];
+    return r;
+  }
+  const res = await resolveStreams(o.u);
+  const out = res.map((s) => Object.assign({}, s, { key: s.key || o.k || "" }));
+  out.trace = res.trace || [];
+  return out;
 }
 
 /* ---------------- /start ---------------- */
 async function start(tok, env) {
   const o = await unseal(tok, env);
   if (!o || !o.u) return json({ ok: false, error: "token galat" }, 403);
-  const streams = await resolveAny(o);
-  if (!streams.length) return json({ ok: false, error: "stream nahi mili" });
+  const frame = kindOf(o.u) === "web" ? "/f?t=" + encodeURIComponent(tok) : "";
+  let streams = [];
+  try { streams = await resolveAny(o); } catch (e) {}
+  if (!streams.length) return json({ ok: false, error: "stream nahi mili", frame: frame });
 
   const out = [];
   for (const s of streams) {
@@ -434,7 +570,14 @@ async function start(tok, env) {
     if (s.type === "dash" && s.key) item.key = s.key;
     out.push(item);
   }
-  return json({ ok: true, streams: out });
+  return json({ ok: true, streams: out, frame: frame });
+}
+
+// asli (original) player ko iframe mein kholne ke liye (jab stream nikal na paaye)
+async function frameRedirect(tok, env) {
+  const o = await unseal(tok, env);
+  if (!o || !o.u || kindOf(o.u) !== "web") return new Response("forbidden", { status: 403, headers: CORS });
+  return new Response(null, { status: 302, headers: { "Location": o.u.replace(/^http:\/\//i, "https://"), "Cache-Control": "no-store" } });
 }
 
 /* ---------------- HLS playlist rewrite ---------------- */
@@ -637,7 +780,8 @@ async function diag(tok, env) {
   let streams;
   try { streams = await resolveAny(o); }
   catch (e) { return json({ ok: false, step: "resolve", host, note: "page kholne mein error" }); }
-  if (!streams.length) return json({ ok: false, step: "resolve", kind: k, host, note: "page mein koi m3u8/mpd nahi mili" });
+  const trace = streams.trace || [];
+  if (!streams.length) return json({ ok: false, step: "resolve", kind: k, host, note: "page mein koi m3u8/mpd nahi mili", trace: trace });
   const out = [];
   for (const s of streams.slice(0, 2)) {
     const h = new Headers({ "User-Agent": UA, "Accept": "*/*" });
@@ -649,7 +793,7 @@ async function diag(tok, env) {
       out.push({ type: s.type, host: sh, status: r.status, ct: r.headers.get("content-type") || "", key: s.key ? "haan" : "nahi", head: t });
     } catch (e) { out.push({ type: s.type, host: sh, status: 0, head: "fetch fail: " + String((e && e.message) || e).slice(0, 60) }); }
   }
-  return json({ ok: true, kind: k, streams: out });
+  return json({ ok: true, kind: k, streams: out, trace: trace });
 }
 
 /* ---------------- router ---------------- */
@@ -666,6 +810,7 @@ export default {
       if (path === "/list") return await list(env);
       if (path === "/start") return await start(u.searchParams.get("t"), env);
       if (path === "/diag") return await diag(u.searchParams.get("t"), env);
+      if (path === "/f") return await frameRedirect(u.searchParams.get("t"), env);
       if (path === "/s") return await stream(u.searchParams.get("t"), env, u.origin, req);
       if (path === "/manifest.webmanifest") {
         return new Response(JSON.stringify(MANIFEST), { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });
