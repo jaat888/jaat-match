@@ -555,6 +555,30 @@ function iconResponse(name) {
   return new Response(ICON_BYTES[name], { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" } });
 }
 
+/* ---------------- /diag (video kyu nahi chala - jaanch) ---------------- */
+async function diag(tok, env) {
+  const o = await unseal(tok, env);
+  if (!o || !o.u) return json({ ok: false, step: "token", note: "token galat - SOURCES / SECRET_KEY secret check karo, phir page reload karo" });
+  const k = kindOf(o.u);
+  let host = ""; try { host = new URL(o.u).host; } catch (e) {}
+  let streams;
+  try { streams = k === "web" ? await resolveStreams(o.u) : [{ url: o.u, type: k, ref: o.r || "" }]; }
+  catch (e) { return json({ ok: false, step: "resolve", host, note: "page kholne mein error" }); }
+  if (!streams.length) return json({ ok: false, step: "resolve", kind: k, host, note: "page mein koi m3u8/mpd nahi mili" });
+  const out = [];
+  for (const s of streams.slice(0, 2)) {
+    const h = new Headers({ "User-Agent": UA, "Accept": "*/*" });
+    if (s.ref) { try { h.set("Referer", s.ref); h.set("Origin", new URL(s.ref).origin); } catch (e) {} }
+    let sh = ""; try { sh = new URL(s.url).host; } catch (e) {}
+    try {
+      const r = await fetch(s.url, { headers: h, redirect: "follow" });
+      const t = (await r.text()).slice(0, 80).replace(/\s+/g, " ");
+      out.push({ type: s.type, host: sh, status: r.status, ct: r.headers.get("content-type") || "", head: t });
+    } catch (e) { out.push({ type: s.type, host: sh, status: 0, head: "fetch fail: " + String((e && e.message) || e).slice(0, 60) }); }
+  }
+  return json({ ok: true, kind: k, streams: out });
+}
+
 /* ---------------- router ---------------- */
 export default {
   async fetch(req, env) {
@@ -568,6 +592,7 @@ export default {
       }
       if (path === "/list") return await list(env);
       if (path === "/start") return await start(u.searchParams.get("t"), env);
+      if (path === "/diag") return await diag(u.searchParams.get("t"), env);
       if (path === "/s") return await stream(u.searchParams.get("t"), env, u.origin, req);
       if (path === "/manifest.webmanifest") {
         return new Response(JSON.stringify(MANIFEST), { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });

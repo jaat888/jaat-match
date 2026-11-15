@@ -329,6 +329,7 @@
           <div class="eb">
             <button id="retryBtn">Dobara try</button>
             <button id="nextBtn2" class="alt">Dusra channel</button>
+            <button id="diagBtn" class="alt">Jaanch</button>
           </div>
         </div>
         <div id="ctl">
@@ -823,6 +824,15 @@
   bigEl.onclick = function(){ togglePlay(); showCtl(); };
   prevEl.onclick = function(){ step(-1); showCtl(); };
   nextEl.onclick = function(){ step(1); showCtl(); };
+  $("#diagBtn").onclick = function(){
+    if(!curItem) return;
+    errS.textContent = "jaanch ho rahi hai...";
+    fetchJson(PROXY + "/diag?t=" + encodeURIComponent(curItem.t)).then(function(r){
+      if(!r){ errS.textContent = "worker se jawab nahi aaya"; return; }
+      if(!r.ok){ errS.textContent = (r.note || "fail") + (r.host ? " [" + r.host + "]" : ""); return; }
+      errS.textContent = r.streams.map(function(s){ return s.type + " " + s.host + " -> HTTP " + s.status + " " + (s.ct || "") + " | " + s.head; }).join("  ||  ");
+    });
+  };
   $("#nextBtn2").onclick = function(){ step(1); };
   muteEl.onclick = function(){ vid.muted = !vid.muted; if(!vid.muted && vid.volume === 0) vid.volume = 1; showCtl(); };
   qBtn.onclick = function(){ qMenu.style.display = qMenu.style.display === "flex" ? "none" : "flex"; showCtl(); };
