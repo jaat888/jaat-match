@@ -293,7 +293,7 @@ async function resolveStreams(target) {
   const visited = new Set();
 
   async function scan(pageUrl, depth, ref) {
-    if (visited.has(pageUrl) || visited.size >= 8) return;
+    if (visited.has(pageUrl) || visited.size >= 12) return;
     visited.add(pageUrl);
     let r;
     try { r = await fetch(pageUrl, { headers: pageHeaders(pageUrl, ref), redirect: "follow" }); }
@@ -336,20 +336,93 @@ async function resolveStreams(target) {
         if (streams.length) break;
       }
     }
+    // player page ke andar ki js / api files bhi dekho (stream wahin chhupi hoti hai)
+    if (!streams.length && depth < 2) {
+      const extra = extraResources(txt, finalUrl).slice(0, 6);
+      for (const x of extra) {
+        await scan(x, depth + 1, finalUrl);
+        if (streams.length) break;
+      }
+    }
   }
 
   await scan(target, 0, "");
   return streams;
 }
 
+// page ki same-site <script src> aur fetch("...") wali api files
+function extraResources(raw, base) {
+  const out = [], seen = new Set();
+  let origin = ""; try { origin = new URL(base).origin; } catch (e) {}
+  const add = (u) => {
+    if (/[{}$]/.test(u)) return;
+    try {
+      const a = new URL(u.replace(/&amp;/g, "&"), base);
+      if (!/^https?:$/.test(a.protocol)) return;
+      if (/\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)$/i.test(a.pathname)) return;
+      const s = a.toString();
+      if (seen.has(s) || s === base) return;
+      seen.add(s); out.push(s);
+    } catch (e) {}
+  };
+  let m;
+  const rs = /<script[^>]+?src=["']([^"']+)["']/gi;
+  while ((m = rs.exec(raw))) { try { if (new URL(m[1], base).origin === origin) add(m[1]); } catch (e) {} }
+  const rf = /(?:fetch|axios\.get|getJSON|\$\.get)\(\s*["'`]([^"'`]+)["'`]/gi;
+  while ((m = rf.exec(raw))) add(m[1]);
+  const ro = /\.open\(\s*["'][A-Za-z]+["']\s*,\s*["'`]([^"'`]+)["'`]/gi;
+  while ((m = ro.exec(raw))) add(m[1]);
+  return out;
+}
+
+// wrapper link ke QUERY ke andar hi manifest + ClearKey hota hai:
+//   .../drm?url=https://x/cenc.mpd&keys=KID:KEY
+//   .../?url=https://x/a.mpd?|drmScheme=clearkey&drmLicense=KID:KEY
+//   .../ios2?url=https://proxy/api/proxy?u=https://y/a.m3u8
+function fromQuery(pageUrl) {
+  let u; try { u = new URL(pageUrl); } catch (e) { return []; }
+  if (!u.search) return [];
+  let q = u.search.slice(1);
+  try { q = decodeURIComponent(q); } catch (e) {}
+  q = normalize(q);
+  let key = "";
+  const km = q.match(/([0-9a-f]{32})["']?\s*[:=,]\s*["']?([0-9a-f]{32})/i);
+  if (km) key = km[1].toLowerCase() + ":" + km[2].toLowerCase();
+  const ref = u.origin + "/";
+  const out = [], seen = new Set();
+  const re = /https?:\/\/[^\s"'&|]+?\.(?:m3u8|mpd)(?:\?[^\s"'&|]*)?/gi;
+  let m;
+  while ((m = re.exec(q))) {
+    let s = m[0].replace(/\?$/, "");
+    // proxy ke andar proxy ho to sabse andar wala asli link hai
+    const hits = []; const rh = /https?:\/\//gi; let h;
+    while ((h = rh.exec(s))) hits.push(h.index);
+    const cands = [];
+    if (hits.length > 1) cands.push(s.slice(hits[hits.length - 1]));
+    cands.push(s);
+    for (const c of cands) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      const t = typeOf(c);
+      out.push({ url: c, type: t, ref: ref, key: t === "dash" ? key : "" });
+    }
+  }
+  return out;
+}
+
+async function resolveAny(o) {
+  const k = kindOf(o.u);
+  if (k !== "web") return [{ url: o.u, type: k, ref: o.r || "", key: o.k || "" }];
+  const q = fromQuery(o.u);
+  if (q.length) return q.map((s) => Object.assign({}, s, { key: s.key || o.k || "" }));
+  return (await resolveStreams(o.u)).map((s) => Object.assign({}, s, { key: o.k || "" }));
+}
+
 /* ---------------- /start ---------------- */
 async function start(tok, env) {
   const o = await unseal(tok, env);
   if (!o || !o.u) return json({ ok: false, error: "token galat" }, 403);
-  const k = kindOf(o.u);
-  let streams;
-  if (k === "web") streams = await resolveStreams(o.u);
-  else streams = [{ url: o.u, type: k, ref: o.r || "" }];
+  const streams = await resolveAny(o);
   if (!streams.length) return json({ ok: false, error: "stream nahi mili" });
 
   const out = [];
@@ -358,7 +431,7 @@ async function start(tok, env) {
       type: s.type,
       src: "/s?t=" + await seal({ u: s.url, r: s.ref, p: s.type === "hls" ? 1 : 0, d: s.type === "dash" ? 1 : 0 }, env)
     };
-    if (s.type === "dash" && o.k) item.key = o.k;
+    if (s.type === "dash" && s.key) item.key = s.key;
     out.push(item);
   }
   return json({ ok: true, streams: out });
@@ -562,7 +635,7 @@ async function diag(tok, env) {
   const k = kindOf(o.u);
   let host = ""; try { host = new URL(o.u).host; } catch (e) {}
   let streams;
-  try { streams = k === "web" ? await resolveStreams(o.u) : [{ url: o.u, type: k, ref: o.r || "" }]; }
+  try { streams = await resolveAny(o); }
   catch (e) { return json({ ok: false, step: "resolve", host, note: "page kholne mein error" }); }
   if (!streams.length) return json({ ok: false, step: "resolve", kind: k, host, note: "page mein koi m3u8/mpd nahi mili" });
   const out = [];
@@ -573,7 +646,7 @@ async function diag(tok, env) {
     try {
       const r = await fetch(s.url, { headers: h, redirect: "follow" });
       const t = (await r.text()).slice(0, 80).replace(/\s+/g, " ");
-      out.push({ type: s.type, host: sh, status: r.status, ct: r.headers.get("content-type") || "", head: t });
+      out.push({ type: s.type, host: sh, status: r.status, ct: r.headers.get("content-type") || "", key: s.key ? "haan" : "nahi", head: t });
     } catch (e) { out.push({ type: s.type, host: sh, status: 0, head: "fetch fail: " + String((e && e.message) || e).slice(0, 60) }); }
   }
   return json({ ok: true, kind: k, streams: out });
